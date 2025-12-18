@@ -1,0 +1,70 @@
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  # Use a custom Dockerfile to install requests
+  build:
+    context: .
+    dockerfile: ./Dockerfile.airflow
+  environment:
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://admin:admin@postgres/airflow
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./staging:/opt/airflow/staging # Agar Airflow bisa akses script staging
+    - ./data_source:/data_source # Agar Airflow bisa akses data_source
+  user: "${AIRFLOW_UID:-1000}:0"
+  depends_on:
+    - postgres
+
+services:
+  # --- DATABASE ---
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=admin
+      - POSTGRES_MULTIPLE_DATABASES=airflow,battery_db
+    ports:
+      - "5435:5432"
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # --- DATA LAKE (SeaweedFS) ---
+  seaweedfs:
+    image: chrislusf/seaweedfs
+    ports:
+      - "8333:8333" # Filer
+      - "9333:9333" # Master
+      - "8080:8080" # Volume
+    command: "server -s3 -filer"
+
+  # --- AIRFLOW (Orchestrator) ---
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8085:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+
+  # --- STREAMLIT (Dashboard) ---
+  streamlit:
+    build: ./streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      - DB_URL=postgresql://admin:admin@postgres:5432/battery_db
+    volumes:
+      - ./streamlit:/app
+    depends_on:
+      - postgres
