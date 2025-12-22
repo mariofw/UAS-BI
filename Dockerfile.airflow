@@ -2,5 +2,5 @@ ARG AIRFLOW_VERSION=2.7.1
 ARG PYTHON_VERSION=3.9
 FROM apache/airflow:${AIRFLOW_VERSION}-python${PYTHON_VERSION}
 
-# Install requests library
-RUN pip install requests
+# Install requests library and other DAG dependencies
+RUN pip install requests pandas numpy psycopg2-binary

@@ -40,11 +40,7 @@ def fetch_and_store_weather_forecast():
         print("✅ Successfully fetched and stored weather forecast data!")
 
     except requests.exceptions.RequestException as e:
-        print(f"⚠️ Warning: Could not fetch weather data ({e}). Creating dummy weather data.")
-        date_today = datetime.now().date()
-        dummy_dates = [date_today + timedelta(days=i) for i in range(7)]
-        weather_records = [{'date': d, 'max_temp_c': 30, 'min_temp_c': 24, 'avg_temp_c': 27, 'condition_text': 'Unavailable'} for d in dummy_dates]
-        df_weather = pd.DataFrame(weather_records)
+        raise Exception(f"❌ Error: Could not fetch weather data: {e}")
 
     df_weather['date'] = pd.to_datetime(df_weather['date'])
     df_weather['weather_id'] = df_weather['date'].dt.strftime('%Y%m%d').astype(int)
