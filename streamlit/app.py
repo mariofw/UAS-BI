@@ -9,10 +9,8 @@ import os
 
 st.set_page_config(page_title="Monitor Baterai Cerdas", layout="wide", page_icon="⚡")
 
-# Koneksi ke Database
 @st.cache_resource
 def get_engine():
-    # Gunakan environment variable DB_URL jika ada (Docker), jika tidak gunakan localhost:5435 (Local)
     db_url = os.getenv('DB_URL', 'postgresql://admin:admin@localhost:5435/battery_db')
     return create_engine(db_url)
 
@@ -46,7 +44,6 @@ def load_weather_forecast():
         st.error(f"Gagal memuat data cuaca: {e}")
         return pd.DataFrame()
 
-# --- Dashboard Utama ---
 st.title("🔋 Sistem Rekomendasi Pengisian Daya Cerdas")
 
 if st.button('🔄 Perbarui Data'):
@@ -59,10 +56,8 @@ with st.spinner('Memuat rekomendasi terbaru...'):
     df_weather = load_weather_forecast()
 
 if not df_rec.empty:
-    # Pilihan perangkat dinamis berdasarkan data yang tersedia
     available_devices = df_rec['device_id'].unique()
     
-    # Mapping nama friendly jika tersedia
     friendly_names = {
         "D001": "Samsung (D001)", 
         "D003": "iPhone (D003)"

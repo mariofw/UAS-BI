@@ -6,21 +6,12 @@ from sqlalchemy import create_engine, text
 import requests
 import os
 
-# Konfigurasi Database
 DB_CONN = 'postgresql://admin:admin@postgres:5432/battery_db'
 
 def load_to_staging_layer():
     engine = create_engine(DB_CONN)
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
-        try:
-            with open('/data_source/data charging.sql', 'r') as f:
-                sql_script = f.read()
-                for statement in sql_script.split(';'):
-                    if statement.strip():
-                        conn.execute(text(statement))
-        except Exception as e:
-            print(f"Warning SQL file: {e}")
 
     df_activity = pd.read_csv('/data_source/log_aktivitas_baterai_hp.csv', sep=';')
     if 'battery_usage_percent' in df_activity.columns:
@@ -33,10 +24,12 @@ def load_to_staging_layer():
     df_specs.to_sql('stg_smartphones', engine, schema='staging', if_exists='replace', index=False)
 
     try:
+        # Langsung extract dari tabel public.charging_logs di Postgres
         df_charging = pd.read_sql("SELECT * FROM public.charging_logs", engine)
         df_charging.to_sql('stg_charging_logs', engine, schema='staging', if_exists='replace', index=False)
-    except:
-        pass
+        print("✅ Charging logs extracted directly from Postgres.")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not extract from public.charging_logs: {e}")
 
     print("✅ Staging Layer Populated Successfully!")
 
@@ -48,7 +41,6 @@ def transform_to_dwh_layer():
     df_stg_phones = pd.read_sql("SELECT * FROM staging.stg_smartphones", engine)
     df_stg_phones['device_id'] = [f'D{i+1:03}' for i in range(len(df_stg_phones))]
     
-    # Perbaikan Nama Kolom
     df_dim_device = df_stg_phones[df_stg_phones['device_id'].isin(['D001', 'D003'])].copy()
     if 'model' in df_dim_device.columns:
         df_dim_device = df_dim_device.rename(columns={'model': 'device_name'})
@@ -80,7 +72,6 @@ def transform_to_dwh_layer():
         df_fact_d3 = df_fact.copy(); df_fact_d3['device_id'] = 'D003'
         df_fact = pd.concat([df_fact_d1, df_fact_d3], ignore_index=True)
 
-    # Pembersihan angka koma sebelum load
     for col in ['screen_time_minutes', 'battery_usage_percent']:
         if col in df_fact.columns:
             df_fact[col] = df_fact[col].astype(str).str.replace(',', '.').astype(float)
