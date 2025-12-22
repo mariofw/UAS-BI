@@ -9,8 +9,8 @@ CREATE DATABASE battery_db;
 -- Buat Skema
 CREATE SCHEMA staging;
 CREATE SCHEMA datawarehouse;
-2
--- Tabel awal untuk charging logs (Sesuai file .sql kamu)
+
+-- Tabel awal untuk charging logs
 CREATE TABLE staging.stg_charging_logs (
     charge_id SERIAL PRIMARY KEY,
     device_id VARCHAR(50),

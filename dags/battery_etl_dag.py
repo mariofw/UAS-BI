@@ -49,9 +49,41 @@ def fetch_and_store_weather_forecast():
         df_weather = pd.DataFrame(weather_records)
 
     df_weather['date'] = pd.to_datetime(df_weather['date'])
+    # Generate weather_id (YYYYMMDD) as Primary Key
+    df_weather['weather_id'] = df_weather['date'].dt.strftime('%Y%m%d').astype(int)
+    
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS datawarehouse;"))
-        df_weather.to_sql('dim_weather_forecast', engine, schema='datawarehouse', if_exists='replace', index=False)
+        df_weather.to_sql('dim_weather_forecast', engine, schema='datawarehouse', if_exists='append', index=False, method='multi') # Use append to avoid wiping history if possible, or handle duplicates
+        # For simplicity in this demo, we might replace if strict uniqueness isn't handled elsewhere, 
+        # but to keep IDs consistent let's replace for now or handle upsert.
+        # Given the previous logic used replace, let's stick to replace BUT we must be careful about FKs.
+        # Actually, simpler: replace ONLY if we don't break FKs. 
+        # But wait, Main DAG creates dummy weather. Optimization DAG updates it.
+        # Let's use specific logic: Delete existing forecast for these dates then append.
+        
+        # Safe Approach for prototype: Just Upsert or Replace if careful. 
+        # Let's use 'replace' but we need to drop FK in fact first? No, that's too complex.
+        # Better: Read existing, update, write back?
+        # Simplest working solution for CLI: 'replace' works IF we drop Fact FKs. 
+        # BUT since we want persistence, let's just write to a temporary table and upsert.
+        
+        # ACTUALLY, to avoid complexity: Just use 'replace' for now. 
+        # NOTE: This might fail if Fact table exists and has FK. 
+        # We will handle the FK drop/re-add in the Main DAG. 
+        # Here, just ensure column exists.
+        
+        # To avoid "cannot drop table" error, we can't use replace if FK exists.
+        # So we delete specific rows and append.
+        try:
+             # Hapus data lama yang tanggalnya sama (agar tidak duplikat PK)
+             dates_to_update = tuple(df_weather['weather_id'].tolist())
+             if dates_to_update:
+                 conn.execute(text(f"DELETE FROM datawarehouse.dim_weather_forecast WHERE weather_id IN {dates_to_update}"))
+        except Exception as e:
+            print(f"Notice: Cleanup failed (maybe table doesn't exist yet): {e}")
+            
+        df_weather.to_sql('dim_weather_forecast', engine, schema='datawarehouse', if_exists='append', index=False)
 
 
 def generate_recommendations_with_new_charging_data():

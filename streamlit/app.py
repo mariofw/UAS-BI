@@ -5,13 +5,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 import time
 from datetime import datetime, timedelta
+import os
 
 st.set_page_config(page_title="Monitor Baterai Cerdas", layout="wide", page_icon="⚡")
 
 # Koneksi ke Database
 @st.cache_resource
 def get_engine():
-    return create_engine('postgresql://admin:admin@postgres:5432/battery_db')
+    # Gunakan environment variable DB_URL jika ada (Docker), jika tidak gunakan localhost:5435 (Local)
+    db_url = os.getenv('DB_URL', 'postgresql://admin:admin@localhost:5435/battery_db')
+    return create_engine(db_url)
 
 engine = get_engine()
 
@@ -20,7 +23,8 @@ def load_recommendations():
     try:
         df = pd.read_sql("SELECT * FROM datawarehouse.final_recommendations", engine)
         return df
-    except Exception:
+    except Exception as e:
+        st.error(f"Gagal memuat rekomendasi: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=60)
@@ -28,7 +32,8 @@ def load_fact_usage():
     try:
         df = pd.read_sql("SELECT * FROM datawarehouse.fact_battery_usage", engine)
         return df
-    except Exception:
+    except Exception as e:
+        st.error(f"Gagal memuat data penggunaan: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=60)
@@ -37,7 +42,8 @@ def load_weather_forecast():
         df = pd.read_sql("SELECT date, avg_temp_c, min_temp_c, max_temp_c FROM datawarehouse.dim_weather_forecast ORDER BY date ASC", engine)
         df['date'] = pd.to_datetime(df['date'])
         return df
-    except Exception:
+    except Exception as e:
+        st.error(f"Gagal memuat data cuaca: {e}")
         return pd.DataFrame()
 
 # --- Dashboard Utama ---
@@ -53,17 +59,28 @@ with st.spinner('Memuat rekomendasi terbaru...'):
     df_weather = load_weather_forecast()
 
 if not df_rec.empty:
-    # Re-introduce device selection
-    device_map = {"Samsung (D001)": "D001", "iPhone (D003)": "D003"}
-    device_name_selection = st.selectbox("Pilih Perangkat untuk Analisis:", options=list(device_map.keys()))
-    selected_device_id = device_map[device_name_selection]
+    # Pilihan perangkat dinamis berdasarkan data yang tersedia
+    available_devices = df_rec['device_id'].unique()
+    
+    # Mapping nama friendly jika tersedia
+    friendly_names = {
+        "D001": "Samsung (D001)", 
+        "D003": "iPhone (D003)"
+    }
+    
+    selected_device_id = st.selectbox(
+        "Pilih Perangkat untuk Analisis:", 
+        options=available_devices,
+        format_func=lambda x: friendly_names.get(x, x)
+    )
 
     device_rec = df_rec[df_rec['device_id'] == selected_device_id]
 
     if not device_rec.empty:
         latest_rec = device_rec.iloc[0]
+        device_display_name = friendly_names.get(selected_device_id, selected_device_id)
 
-        st.subheader(f"💡 Rekomendasi Pengisian Daya untuk {device_name_selection}")
+        st.subheader(f"💡 Rekomendasi Pengisian Daya untuk {device_display_name}")
         
         rec_col1, rec_col2 = st.columns(2)
         with rec_col1:
@@ -101,10 +118,10 @@ if not df_rec.empty:
                     weekly_usage = df_device_fact.groupby('full_date')['battery_usage_percent'].sum().reset_index()
                     weekly_usage.columns = ['Tanggal', 'Persentase Penggunaan Baterai']
                     
-                    fig_usage = px.bar(weekly_usage, x='Tanggal', y='Persentase Penggunaan Baterai', title=f'Penggunaan Baterai Harian untuk {device_name_selection}')
+                    fig_usage = px.bar(weekly_usage, x='Tanggal', y='Persentase Penggunaan Baterai', title=f'Penggunaan Baterai Harian untuk {device_display_name}')
                     st.plotly_chart(fig_usage, use_container_width=True)
                 else:
-                    st.info(f"Tidak ada data penggunaan baterai untuk {device_name_selection}.")
+                    st.info(f"Tidak ada data penggunaan baterai untuk {device_display_name}.")
             else:
                 st.info("Tidak ada data penggunaan baterai.")
 
@@ -123,6 +140,6 @@ if not df_rec.empty:
                 st.info("Tidak ada data ramalan cuaca. Pastikan API key valid.")
 
     else:
-        st.warning(f"Tidak ada rekomendasi untuk {device_name_selection}.")
+        st.warning(f"Tidak ada rekomendasi untuk {selected_device_id}.")
 else:
     st.warning("Tidak ada data rekomendasi ditemukan. Jalankan DAG 'battery_optimization_etl_with_weather'.")
