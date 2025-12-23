@@ -118,11 +118,11 @@ if not df_rec.empty and not df_devices.empty:
             
             rec_col1, rec_col2 = st.columns(2)
             with rec_col1:
-                st.info(f"**Rekomendasi Berdasarkan Penggunaan:** `{latest_rec['recommended_charge_time_usage']}`")
+                st.info(f"**Waktu Pengisian Direkomendasikan (Penggunaan):** `{latest_rec['recommended_charge_time_usage']}`")
                 st.write(latest_rec['explanation_usage'])
 
             with rec_col2:
-                st.success(f"**Rekomendasi Berdasarkan Suhu:** `{latest_rec['recommended_charge_time_temp']}`")
+                st.success(f"**Waktu Pengisian Direkomendasikan (Suhu):** `{latest_rec['recommended_charge_time_temp']}`")
                 st.write(latest_rec['explanation_temp'])
 
             st.divider()
@@ -130,14 +130,12 @@ if not df_rec.empty and not df_devices.empty:
             col_charge_time, col_pred_tomorrow = st.columns(2)
             with col_charge_time:
                 st.subheader("⚡ Estimasi Waktu Pengisian (20% → 80%)")
-                charge_col1, charge_col2 = st.columns(2)
-                charge_col1.metric("🚀 Fast Charging", f"{latest_rec['estimated_charging_time_minutes']} min")
-                charge_col2.metric("🔌 Regular Charge", f"{latest_rec['estimated_charging_time_normal']} min")
+                st.metric("Estimasi Durasi", f"{latest_rec['estimated_charging_time_minutes']} menit")
             
             with col_pred_tomorrow:
                 st.subheader("🔮 Prediksi untuk Besok")
-                st.info(f"**Waktu Pengisian Berbasis Penggunaan:** `{latest_rec['prediction_tomorrow_usage']}`")
-                st.success(f"**Waktu Pengisian Berbasis Suhu:** `{latest_rec['prediction_tomorrow_temp']}`")
+                st.info(f"**Prediksi Waktu Pengisian (Penggunaan):** `{latest_rec['prediction_tomorrow_usage']}`")
+                st.success(f"**Prediksi Waktu Pengisian (Suhu):** `{latest_rec['prediction_tomorrow_temp']}`")
             
             st.divider()
             

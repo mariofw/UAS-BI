@@ -115,6 +115,9 @@ def generate_recommendations_with_new_charging_data():
     # Ambil Data Spek Smartphone langsung dari Dimensi (Star Schema)
     df_dim_dev = pd.read_sql("SELECT * FROM datawarehouse.dim_device", engine)
     
+    # Ambil Charging Logs (Restore missing line)
+    df_charging = pd.read_sql("SELECT device_id, plug_in_time, plug_out_time, start_level, end_level FROM public.charging_logs", engine)
+
     df_weather_forecast['date'] = pd.to_datetime(df_weather_forecast['date'])
     df_charging['plug_in_time'] = pd.to_datetime(df_charging['plug_in_time'])
     df_charging['dur_minutes'] = (pd.to_datetime(df_charging['plug_out_time']) - df_charging['plug_in_time']).dt.total_seconds() / 60
@@ -192,7 +195,7 @@ def generate_recommendations_with_new_charging_data():
                 f"**✅ Saran Optimalisasi:**\n"
                 f"- **Strategi:** Untuk mencegah baterai drop di jam-jam krusial menjelang waktu charge biasa (sekitar pukul **{critical_time:02d}:00**), "
                 f"kami sarankan Anda mengisi daya lebih awal pada pukul **{rec_h:02d}:00**.\n"
-                f"- **Estimasi Durasi:** **{est_time_fast} menit** (Fast Charging) atau **{est_time_normal} menit** (Normal)."
+                f"- **Estimasi Durasi:** Sekitar **{est_time_normal} menit**."
             )
         else:
             rec_h = 20
