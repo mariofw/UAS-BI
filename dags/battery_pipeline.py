@@ -72,15 +72,40 @@ def load_from_lake_to_staging():
     load_s3_csv('raw/charging_logs.csv', 'stg_charging_logs')
 
 def transform_to_dwh_layer():
-    """GOLD: Staging ke DWH"""
+    """GOLD: Staging ke DWH dengan Star Schema & Relationships"""
     engine = get_db_engine()
-    with engine.begin() as conn: conn.execute(text("CREATE SCHEMA IF NOT EXISTS datawarehouse;"))
+    
+    # 1. Bersihkan tabel lama agar tidak konflik constraint saat replace
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS datawarehouse;"))
+        conn.execute(text("DROP TABLE IF EXISTS datawarehouse.fact_battery_usage CASCADE;"))
+        conn.execute(text("DROP TABLE IF EXISTS datawarehouse.dim_device CASCADE;"))
+        conn.execute(text("DROP TABLE IF EXISTS datawarehouse.dim_application CASCADE;"))
+        conn.execute(text("DROP TABLE IF EXISTS datawarehouse.dim_date CASCADE;"))
 
-    # Dim Device
-    df_dim_dev = pd.DataFrame([
-        {'device_id': 'D001', 'device_name': 'Samsung Galaxy A56'},
-        {'device_id': 'D003', 'device_name': 'iPhone 12 Pro Max'}
-    ])
+    # --- DIMENSIONS ---
+    
+    # Dim Device: Ambil data LENGKAP dari stg_smartphones
+    target_models = ['Samsung Galaxy A54 5G', 'Apple iPhone 12 Pro (256GB)']
+    
+    # Ambil semua kolom
+    df_specs = pd.read_sql(f"SELECT * FROM staging.stg_smartphones WHERE model IN {tuple(target_models)}", engine)
+    
+    # Urutkan agar ID konsisten (Samsung=D001, iPhone=D003) -> Kita map manual
+    # Buat dictionary map ID
+    id_map = {
+        'Samsung Galaxy A54 5G': 'D001',
+        'Apple iPhone 12 Pro (256GB)': 'D003'
+    }
+    
+    df_dim_dev = df_specs.copy()
+    df_dim_dev['device_id'] = df_dim_dev['model'].map(id_map)
+    df_dim_dev = df_dim_dev.rename(columns={'model': 'device_name'})
+    
+    # Pindahkan device_id ke depan (opsional, untuk kerapian)
+    cols = ['device_id', 'device_name'] + [c for c in df_dim_dev.columns if c not in ['device_id', 'device_name']]
+    df_dim_dev = df_dim_dev[cols]
+    
     df_dim_dev.to_sql('dim_device', engine, schema='datawarehouse', if_exists='replace', index=False)
 
     # Dim App
@@ -96,6 +121,8 @@ def transform_to_dwh_layer():
     df_dim_date['day_of_week'] = df_dim_date['full_date'].dt.day_name()
     df_dim_date.to_sql('dim_date', engine, schema='datawarehouse', if_exists='replace', index=False)
 
+    # --- FACTS ---
+    
     # Fact Battery
     df_act = pd.read_sql("SELECT * FROM staging.stg_activity", engine)
     df_act['activity_date'] = pd.to_datetime(df_act['activity_date'])
@@ -104,12 +131,50 @@ def transform_to_dwh_layer():
     df_fact = df_act.merge(df_dim_date, left_on='activity_date', right_on='full_date', how='left')
     df_fact = df_fact.merge(df_app, on='application_name', how='left')
     
-    # Clean up columns and ensure device_id is present
-    # Hapus logika duplikasi hardcoded yang lama!
+    # Simulasikan Device ID (Distribusi Random untuk contoh data)
+    import numpy as np
+    device_ids = df_dim_dev['device_id'].tolist()
+    # Kita set seed agar konsisten, atau random full
+    np.random.seed(42) 
+    df_fact['device_id'] = np.random.choice(device_ids, size=len(df_fact))
+
     df_fact_final = df_fact.copy()
-    
     df_fact_final['weather_id'] = df_fact_final['date_id']
+    
+    # Pastikan hanya kolom yang relevan masuk ke Fact Table
+    # (Opsional, tapi baik untuk kebersihan schema)
+    
     df_fact_final.to_sql('fact_battery_usage', engine, schema='datawarehouse', if_exists='replace', index=False)
+
+    # --- ADD CONSTRAINTS (STAR SCHEMA ENFORCEMENT) ---
+    # Pandas .to_sql tidak membuat Primary/Foreign Keys, jadi kita alter manual.
+    with engine.begin() as conn:
+        # 1. Set Primary Keys
+        conn.execute(text("ALTER TABLE datawarehouse.dim_device ADD PRIMARY KEY (device_id);"))
+        conn.execute(text("ALTER TABLE datawarehouse.dim_application ADD PRIMARY KEY (application_id);"))
+        conn.execute(text("ALTER TABLE datawarehouse.dim_date ADD PRIMARY KEY (date_id);"))
+        
+        # 2. Set Foreign Keys (Relasi Antar Tabel)
+        # FK Device
+        conn.execute(text("""
+            ALTER TABLE datawarehouse.fact_battery_usage 
+            ADD CONSTRAINT fk_fact_device 
+            FOREIGN KEY (device_id) REFERENCES datawarehouse.dim_device(device_id);
+        """))
+        
+        # FK Application
+        conn.execute(text("""
+            ALTER TABLE datawarehouse.fact_battery_usage 
+            ADD CONSTRAINT fk_fact_app 
+            FOREIGN KEY (application_id) REFERENCES datawarehouse.dim_application(application_id);
+        """))
+        
+        # FK Date
+        conn.execute(text("""
+            ALTER TABLE datawarehouse.fact_battery_usage 
+            ADD CONSTRAINT fk_fact_date 
+            FOREIGN KEY (date_id) REFERENCES datawarehouse.dim_date(date_id);
+        """))
 
 # --- DAG ---
 with DAG('battery_data_pipeline_dimensional', start_date=datetime(2025, 1, 1), schedule_interval=None, catchup=False) as dag:

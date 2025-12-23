@@ -112,12 +112,8 @@ def generate_recommendations_with_new_charging_data():
     except:
         current_temp = None
 
-    # Ambil Charging Logs dengan Level Baterai untuk hitung kecepatan
-    df_charging = pd.read_sql("SELECT device_id, plug_in_time, plug_out_time, start_level, end_level FROM public.charging_logs", engine)
-    
-    # Ambil Data Spek Smartphone untuk perhitungan teoritis
-    df_specs = pd.read_sql("SELECT model, battery_capacity, fast_charging FROM staging.stg_smartphones", engine)
-    df_dim_dev = pd.read_sql("SELECT device_id, device_name FROM datawarehouse.dim_device", engine)
+    # Ambil Data Spek Smartphone langsung dari Dimensi (Star Schema)
+    df_dim_dev = pd.read_sql("SELECT * FROM datawarehouse.dim_device", engine)
     
     df_weather_forecast['date'] = pd.to_datetime(df_weather_forecast['date'])
     df_charging['plug_in_time'] = pd.to_datetime(df_charging['plug_in_time'])
@@ -132,29 +128,25 @@ def generate_recommendations_with_new_charging_data():
     
     # Loop per device
     for dev_id, df_dev in df_usage.groupby('device_id'):
-        # Get Device Name and Specs
-        dev_info = df_dim_dev[df_dim_dev['device_id'] == dev_id].iloc[0]
-        dev_name = dev_info['device_name']
-        spec_row = df_specs[df_specs['model'] == dev_name]
+        # Ambil spek lengkap dari Dim Device
+        dev_row = df_dim_dev[df_dim_dev['device_id'] == dev_id].iloc[0]
+        dev_name = dev_row['device_name']
         
-        # Manual Override untuk device yang diminta user
+        # Gunakan data dari CSV yang sudah ada di dimensi
+        cap_mah = float(dev_row['battery_capacity']) if pd.notnull(dev_row['battery_capacity']) else 5000
+        watt = float(dev_row['fast_charging']) if pd.notnull(dev_row['fast_charging']) else 15
+        
+        # Manual Override hanya untuk penyesuaian khusus jika diperlukan
         overrides = {
-            'Samsung Galaxy A56': {'cap': 5000, 'watt': 25}, # Estimasi spek series A
-            'iPhone 12 Pro Max': {'cap': 3687, 'watt': 20}
+            'Samsung Galaxy A54 5G': {'cap': 5000, 'watt': 25},
+            'Apple iPhone 12 Pro (256GB)': {'cap': 2815, 'watt': 20}
         }
         
         if dev_name in overrides:
             cap_mah = overrides[dev_name]['cap']
             watt = overrides[dev_name]['watt']
-        elif not spec_row.empty:
-            cap_mah = float(spec_row.iloc[0]['battery_capacity']) if pd.notnull(spec_row.iloc[0]['battery_capacity']) else 5000
-            watt = float(spec_row.iloc[0]['fast_charging']) if pd.notnull(spec_row.iloc[0]['fast_charging']) else 15
-        else:
-            cap_mah = 5000
-            watt = 15
         
         # Hitung Waktu Teoretis Hardware (20% ke 80% = 60% charge)
-        # Physics: mAh * 3.7V / 1000 = Wh. Wh * 0.6 / Watt * 60 min * Efficiency(0.85)
         theoretical_min = int(((cap_mah * 3.7 / 1000) * 0.6) / (watt * 0.85) * 60)
 
         # 1. Analisis Kebiasaan (Real Data dari Charging Logs)
