@@ -18,6 +18,7 @@ engine = get_engine()
 
 @st.cache_data(ttl=60)
 def load_recommendations():
+    # Fetch latest ETL output
     try:
         df = pd.read_sql("SELECT * FROM datawarehouse.final_recommendations", engine)
         return df
@@ -44,6 +45,15 @@ def load_weather_forecast():
         st.error(f"Gagal memuat data cuaca: {e}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=60)
+def load_current_weather():
+    try:
+        df = pd.read_sql("SELECT * FROM datawarehouse.fact_weather_realtime ORDER BY timestamp DESC LIMIT 1", engine)
+        return df
+    except Exception as e:
+        # Mungkin tabel belum dibuat jika DAG baru belum jalan
+        return pd.DataFrame()
+
 st.title("🔋 Sistem Rekomendasi Pengisian Daya Cerdas")
 
 if st.button('🔄 Perbarui Data'):
@@ -54,13 +64,24 @@ with st.spinner('Memuat rekomendasi terbaru...'):
     df_rec = load_recommendations()
     df_fact = load_fact_usage()
     df_weather = load_weather_forecast()
+    df_current_weather = load_current_weather()
+
+# Tampilkan Cuaca Saat Ini
+if not df_current_weather.empty:
+    curr = df_current_weather.iloc[0]
+    st.metric(
+        label=f"Cuaca Saat Ini ({curr['condition_text']})", 
+        value=f"{curr['temp_c']} °C", 
+        delta=f"Terasa {curr['feelslike_c']} °C",
+        delta_color="off"
+    )
 
 if not df_rec.empty:
     available_devices = df_rec['device_id'].unique()
     
     friendly_names = {
-        "D001": "Samsung (D001)", 
-        "D003": "iPhone (D003)"
+        "D001": "Samsung Galaxy A56", 
+        "D003": "iPhone 12 Pro Max"
     }
     
     selected_device_id = st.selectbox(
@@ -90,8 +111,10 @@ if not df_rec.empty:
 
         col_charge_time, col_pred_tomorrow = st.columns(2)
         with col_charge_time:
-            st.subheader("⚡ Estimasi Waktu Pengisian")
-            st.warning(f"**Waktu Pengisian dari 20% ke 80%:** `{latest_rec['estimated_charging_time_minutes']}` menit")
+            st.subheader("⚡ Estimasi Waktu Pengisian (20% → 80%)")
+            charge_col1, charge_col2 = st.columns(2)
+            charge_col1.metric("🚀 Fast Charging", f"{latest_rec['estimated_charging_time_minutes']} min")
+            charge_col2.metric("🔌 Regular Charge", f"{latest_rec['estimated_charging_time_normal']} min")
         
         with col_pred_tomorrow:
             st.subheader("🔮 Prediksi untuk Besok")
@@ -102,6 +125,7 @@ if not df_rec.empty:
         
         st.subheader("📈 Tren Penggunaan & Cuaca")
         
+        # Visuals: Usage trends & Weather forecast
         chart_col1, chart_col2 = st.columns(2)
 
         with chart_col1:

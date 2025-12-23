@@ -5,182 +5,264 @@ import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
 import requests
+import boto3
+import json
+import logging
 
-default_args = {
-    'owner': 'airflow',
-    'start_date': datetime(2025, 1, 1),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
-}
-
+# --- KONFIGURASI ---
+DB_URI = 'postgresql://admin:admin@postgres:5432/battery_db'
+S3_CONFIG = {'endpoint_url': 'http://seaweedfs:8333', 'aws_access_key_id': 'any', 'aws_secret_access_key': 'any'}
+BUCKET_NAME = 'battery-lake'
 API_KEY = "8dc59c09bc2d4075aa4130715251812"
 CITY = "banjarmasin"
-WEATHER_API_URL = f"http://api.weatherapi.com/v1/forecast.json?key={API_KEY}&q={CITY}&days=7&aqi=no&alerts=no"
+logger = logging.getLogger("airflow.task")
 
+# --- TASKS ---
 def fetch_and_store_weather_forecast():
-    engine = create_engine('postgresql://admin:admin@postgres:5432/battery_db')
-    
-    try:
-        response = requests.get(WEATHER_API_URL, timeout=10)
-        response.raise_for_status()
-        weather_data = response.json()
-        
-        forecast_days = weather_data['forecast']['forecastday']
-        weather_records = []
-        for day in forecast_days:
-            weather_records.append({
-                'date': day['date'],
-                'max_temp_c': day['day']['maxtemp_c'],
-                'min_temp_c': day['day']['mintemp_c'],
-                'avg_temp_c': day['day']['avgtemp_c'],
-                'condition_text': day['day']['condition']['text']
-            })
-        
-        df_weather = pd.DataFrame(weather_records)
-        print("✅ Successfully fetched and stored weather forecast data!")
+    """BRONZE & GOLD: API ke Lake & DWH (Forecast)"""
+    # Ambil API
+    url = f"http://api.weatherapi.com/v1/forecast.json?key={API_KEY}&q={CITY}&days=7"
+    data = requests.get(url).json()
 
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"❌ Error: Could not fetch weather data: {e}")
+    # Simpan ke Lake (Bronze)
+    s3 = boto3.client('s3', **S3_CONFIG)
+    try: s3.create_bucket(Bucket=BUCKET_NAME)
+    except: pass
+    s3.put_object(Body=json.dumps(data), Bucket=BUCKET_NAME, Key=f'raw/weather_forecast_{datetime.now().strftime("%Y%m%d")}.json')
 
-    df_weather['date'] = pd.to_datetime(df_weather['date'])
-    df_weather['weather_id'] = df_weather['date'].dt.strftime('%Y%m%d').astype(int)
+    # Proses ke DWH (Gold)
+    forecast = data['forecast']['forecastday']
+    weather_data = [{
+        'date': d['date'],
+        'max_temp_c': d['day']['maxtemp_c'],
+        'min_temp_c': d['day']['mintemp_c'],
+        'avg_temp_c': d['day']['avgtemp_c'],
+        'condition_text': d['day']['condition']['text']
+    } for d in forecast]
     
+    df = pd.DataFrame(weather_data)
+    df['date'] = pd.to_datetime(df['date'])
+    df['weather_id'] = df['date'].dt.strftime('%Y%m%d').astype(int)
+    
+    engine = create_engine(DB_URI)
     with engine.begin() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS datawarehouse;"))
-        try:
-             dates_to_update = tuple(df_weather['weather_id'].tolist())
-             if dates_to_update:
-                 conn.execute(text(f"DELETE FROM datawarehouse.dim_weather_forecast WHERE weather_id IN {dates_to_update}"))
-        except Exception as e:
-            print(f"Notice: Cleanup failed: {e}")
-            
-        df_weather.to_sql('dim_weather_forecast', engine, schema='datawarehouse', if_exists='append', index=False)
+        ids = tuple(df['weather_id'].tolist())
+        if ids:
+            try:
+                conn.execute(text(f"DELETE FROM datawarehouse.dim_weather_forecast WHERE weather_id IN {ids}"))
+            except:
+                pass # Table doesn't exist yet
+        df.to_sql('dim_weather_forecast', engine, schema='datawarehouse', if_exists='append', index=False)
 
+def fetch_current_weather():
+    """BRONZE & GOLD: API ke Lake & DWH (Realtime)"""
+    # Ambil API Current
+    url = f"http://api.weatherapi.com/v1/current.json?key={API_KEY}&q={CITY}&aqi=no"
+    data = requests.get(url).json()
+
+    # Simpan ke Lake (Bronze)
+    s3 = boto3.client('s3', **S3_CONFIG)
+    try: s3.create_bucket(Bucket=BUCKET_NAME)
+    except: pass
+    s3.put_object(Body=json.dumps(data), Bucket=BUCKET_NAME, Key=f'raw/weather_current_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+
+    # Proses ke DWH (Gold)
+    current = data['current']
+    weather_data = [{
+        'timestamp': data['location']['localtime'],
+        'temp_c': current['temp_c'],
+        'feelslike_c': current['feelslike_c'],
+        'humidity': current['humidity'],
+        'condition_text': current['condition']['text'],
+        'uv': current['uv']
+    }]
+    
+    df = pd.DataFrame(weather_data)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    engine = create_engine(DB_URI)
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS datawarehouse;"))
+        # Kita append saja agar punya history per jam/waktu run DAG
+        df.to_sql('fact_weather_realtime', engine, schema='datawarehouse', if_exists='append', index=False)
 
 def generate_recommendations_with_new_charging_data():
-    engine = create_engine('postgresql://admin:admin@postgres:5432/battery_db')
+    """GOLD: Hitung Rekomendasi"""
+    engine = create_engine(DB_URI)
+    
+    # Ambil Data Usage dengan Kategori
+    try:
+        df_usage = pd.read_sql("SELECT device_id, date_id, battery_usage_percent, activity_category FROM datawarehouse.fact_battery_usage", engine)
+    except:
+        # Fallback jika kolom activity_category belum ada di fact (tergantung pipeline)
+        df_usage = pd.read_sql("SELECT device_id, date_id, battery_usage_percent FROM datawarehouse.fact_battery_usage", engine)
+        df_usage['activity_category'] = 'General'
 
     try:
-        query_usage = "SELECT device_id, date_id, battery_usage_percent FROM datawarehouse.fact_battery_usage"
-        df_usage = pd.read_sql(query_usage, engine)
-        if df_usage.empty:
-            print("Warning: fact_battery_usage is empty.")
-            return
-
-        query_weather = "SELECT date, avg_temp_c, min_temp_c, max_temp_c FROM datawarehouse.dim_weather_forecast"
-        df_weather = pd.read_sql(query_weather, engine)
-        df_weather['date'] = pd.to_datetime(df_weather['date'])
-        
-        query_devices = "SELECT device_id, battery_capacity, fast_charging FROM datawarehouse.dim_device"
-        df_devices = pd.read_sql(query_devices, engine)
-
-        query_charging = "SELECT device_id, plug_in_time, plug_out_time FROM public.charging_logs"
-        df_charging = pd.read_sql(query_charging, engine)
-        df_charging['plug_in_time'] = pd.to_datetime(df_charging['plug_in_time'])
-        df_charging['plug_out_time'] = pd.to_datetime(df_charging['plug_out_time'])
-        df_charging['charging_duration'] = (df_charging['plug_out_time'] - df_charging['plug_in_time']).dt.total_seconds() / 60
-
-    except Exception as e:
-        print(f"Error loading data from data warehouse: {e}")
-        return
-
-    all_recommendations = []
+        df_weather_forecast = pd.read_sql("SELECT date, avg_temp_c, min_temp_c, max_temp_c FROM datawarehouse.dim_weather_forecast", engine)
+    except:
+        # Fallback empty forecast
+        df_weather_forecast = pd.DataFrame(columns=['date', 'avg_temp_c', 'min_temp_c', 'max_temp_c'])
     
-    hourly_distribution_d001 = np.array([0.01, 0.01, 0.01, 0.01, 0.02, 0.04, 0.07, 0.08, 0.07, 0.06, 0.05, 0.05, 0.06, 0.07, 0.06, 0.05, 0.05, 0.06, 0.07, 0.08, 0.06, 0.04, 0.03, 0.02])
-    hourly_distribution_d003 = np.array([0.01, 0.01, 0.01, 0.01, 0.02, 0.03, 0.05, 0.06, 0.06, 0.05, 0.04, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.09, 0.08, 0.06, 0.04, 0.02])
+    # Ambil Weather Current Terakhir
+    try:
+        df_weather_current = pd.read_sql("SELECT * FROM datawarehouse.fact_weather_realtime ORDER BY timestamp DESC LIMIT 1", engine)
+        current_temp = df_weather_current.iloc[0]['temp_c'] if not df_weather_current.empty else None
+    except:
+        current_temp = None
 
-    for device_id, df_device_usage in df_usage.groupby('device_id'):
+    # Ambil Charging Logs dengan Level Baterai untuk hitung kecepatan
+    df_charging = pd.read_sql("SELECT device_id, plug_in_time, plug_out_time, start_level, end_level FROM public.charging_logs", engine)
+    
+    # Ambil Data Spek Smartphone untuk perhitungan teoritis
+    df_specs = pd.read_sql("SELECT model, battery_capacity, fast_charging FROM staging.stg_smartphones", engine)
+    df_dim_dev = pd.read_sql("SELECT device_id, device_name FROM datawarehouse.dim_device", engine)
+    
+    df_weather_forecast['date'] = pd.to_datetime(df_weather_forecast['date'])
+    df_charging['plug_in_time'] = pd.to_datetime(df_charging['plug_in_time'])
+    df_charging['dur_minutes'] = (pd.to_datetime(df_charging['plug_out_time']) - df_charging['plug_in_time']).dt.total_seconds() / 60
+    
+    # Hitung Kecepatan Charge (% per menit)
+    df_charging['charged_percent'] = df_charging['end_level'] - df_charging['start_level']
+    df_charging['charge_speed'] = df_charging['charged_percent'] / df_charging['dur_minutes']
+    df_charging['charge_speed'] = df_charging['charge_speed'].replace([np.inf, -np.inf], 0)
+
+    all_rec = []
+    
+    # Loop per device
+    for dev_id, df_dev in df_usage.groupby('device_id'):
+        # Get Device Name and Specs
+        dev_info = df_dim_dev[df_dim_dev['device_id'] == dev_id].iloc[0]
+        dev_name = dev_info['device_name']
+        spec_row = df_specs[df_specs['model'] == dev_name]
         
-        if device_id == 'D001':
-            hourly_distribution = hourly_distribution_d001
+        # Manual Override untuk device yang diminta user
+        overrides = {
+            'Samsung Galaxy A56': {'cap': 5000, 'watt': 25}, # Estimasi spek series A
+            'iPhone 12 Pro Max': {'cap': 3687, 'watt': 20}
+        }
+        
+        if dev_name in overrides:
+            cap_mah = overrides[dev_name]['cap']
+            watt = overrides[dev_name]['watt']
+        elif not spec_row.empty:
+            cap_mah = float(spec_row.iloc[0]['battery_capacity']) if pd.notnull(spec_row.iloc[0]['battery_capacity']) else 5000
+            watt = float(spec_row.iloc[0]['fast_charging']) if pd.notnull(spec_row.iloc[0]['fast_charging']) else 15
         else:
-            hourly_distribution = hourly_distribution_d003
+            cap_mah = 5000
+            watt = 15
+        
+        # Hitung Waktu Teoretis Hardware (20% ke 80% = 60% charge)
+        # Physics: mAh * 3.7V / 1000 = Wh. Wh * 0.6 / Watt * 60 min * Efficiency(0.85)
+        theoretical_min = int(((cap_mah * 3.7 / 1000) * 0.6) / (watt * 0.85) * 60)
 
-        df_device_usage['date'] = pd.to_datetime(df_device_usage['date_id'], format='%Y%m%d')
-        df_device_usage['day_of_week'] = df_device_usage['date'].dt.day_name()
-        daily_total_usage = df_device_usage.groupby('day_of_week')['battery_usage_percent'].sum()
+        # 1. Analisis Kebiasaan (Real Data dari Charging Logs)
+        dev_charging = df_charging[df_charging['device_id'] == dev_id].copy()
         
-        simulated_hourly_usage = [{'hour': h, 'usage': sum(daily_total_usage * hourly_distribution[h])} for h in range(24)]
-        df_hourly = pd.DataFrame(simulated_hourly_usage)
-        peak_hour_usage = df_hourly.set_index('hour')['usage'].idxmax()
-        recommended_hour_usage = max(0, peak_hour_usage - 2)
-        
-        today_weather = df_weather.iloc[0]
-        temp_curve = np.sin(np.linspace(0, np.pi, 24))
-        today_hourly_temp = today_weather['min_temp_c'] + (today_weather['max_temp_c'] - today_weather['min_temp_c']) * temp_curve
-        coolest_hour = np.argmin(today_hourly_temp)
-        
-        tomorrow_date = datetime.now().date() + timedelta(days=1)
-        tomorrow_day_of_week = (datetime.now() + timedelta(days=1)).strftime('%A')
-        
-        tomorrow_weather_df = df_weather[df_weather['date'].dt.date == tomorrow_date]
-        if not tomorrow_weather_df.empty:
-            tomorrow_weather = tomorrow_weather_df.iloc[0]
-            tomorrow_hourly_temp = tomorrow_weather['min_temp_c'] + (tomorrow_weather['max_temp_c'] - tomorrow_weather['min_temp_c']) * temp_curve
-            coolest_hour_tomorrow = np.argmin(tomorrow_hourly_temp)
+        # Fast Charging (Quantile 90%) vs Normal Charging (Average)
+        if not dev_charging.empty and dev_charging['charge_speed'].max() > 0:
+            fast_speed = dev_charging['charge_speed'].quantile(0.9)
+            normal_speed = dev_charging['charge_speed'].mean()
+            
+            if fast_speed == 0: fast_speed = dev_charging['charge_speed'].max()
+            
+            est_time_fast = int(60 / fast_speed) if fast_speed > 0 else 60
+            est_time_normal = int(60 / normal_speed) if normal_speed > 0 else 90
         else:
-            coolest_hour_tomorrow = coolest_hour
+            est_time_fast = theoretical_min # Fallback ke teori
+            est_time_normal = int(theoretical_min * 1.5)
 
-        if tomorrow_day_of_week in daily_total_usage.index:
-            tomorrow_usage = daily_total_usage[tomorrow_day_of_week]
-            simulated_hourly_usage_tomorrow = [{'hour': h, 'usage': tomorrow_usage * hourly_distribution[h]} for h in range(24)]
-            df_hourly_tomorrow = pd.DataFrame(simulated_hourly_usage_tomorrow)
-            peak_hour_tomorrow_usage = df_hourly_tomorrow.set_index('hour')['usage'].idxmax()
-            recommended_hour_tomorrow_usage = max(0, peak_hour_tomorrow_usage - 2)
+        # Analisis Kategori Penggunaan Terboros
+        top_cat = "Umum"
+        if 'activity_category' in df_dev.columns:
+            cat_usage = df_dev.groupby('activity_category')['battery_usage_percent'].sum()
+            if not cat_usage.empty:
+                top_cat = cat_usage.idxmax()
+
+        if not dev_charging.empty:
+            dev_charging['hour'] = dev_charging['plug_in_time'].dt.hour
+            if not dev_charging['hour'].mode().empty:
+                usual_charge_hour = dev_charging['hour'].mode().iloc[0]
+            else:
+                usual_charge_hour = 20
+            
+            # Inferensi: Jika user charge jam X, berarti jam X-1 baterai sudah kritis/low.
+            # Rekomendasi: Charge jam X-3 (Sore/Siang) agar aman sampai malam.
+            critical_time = (usual_charge_hour - 1) % 24
+            rec_h = (usual_charge_hour - 3) % 24 
+            
+            expl_usage = (
+                f"**📊 Analisis Kebiasaan (Behavioral Analysis):**\n"
+                f"- **Spesifikasi:** {dev_name} ({cap_mah}mAh, {watt}W Max).\n"
+                f"- **Pola:** Anda sering mengisi daya sekitar pukul **{usual_charge_hour:02d}:00**.\n"
+                f"- **Aktivitas Dominan:** **'{top_cat}'**.\n\n"
+                f"**✅ Saran Optimalisasi:**\n"
+                f"- **Strategi:** Untuk mencegah baterai drop di jam-jam krusial menjelang waktu charge biasa (sekitar pukul **{critical_time:02d}:00**), "
+                f"kami sarankan Anda mengisi daya lebih awal pada pukul **{rec_h:02d}:00**.\n"
+                f"- **Estimasi Durasi:** **{est_time_fast} menit** (Fast Charging) atau **{est_time_normal} menit** (Normal)."
+            )
         else:
-            recommended_hour_tomorrow_usage = recommended_hour_usage
+            rec_h = 20
+            expl_usage = f"Data device {dev_name} ({cap_mah}mAh) terdeteksi. Silakan lakukan pengisian daya agar sistem bisa menganalisis kebiasaan Anda."
 
-        device_info = df_devices[df_devices['device_id'] == device_id].iloc[0]
-        battery_capacity_mah = device_info['battery_capacity']
+        # 2. Jam Dingin (Forecast - Besok)
+        # Cari forecast untuk besok
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        w_tomorrow = df_weather_forecast[df_weather_forecast['date'] == tomorrow]
         
-        fast_charging_watts = 10
-        if 'fast_charging' in device_info and pd.notna(device_info['fast_charging']):
-            fast_charging_watts = device_info['fast_charging']
-        
-        energy_to_charge_wh = (battery_capacity_mah / 1000) * 3.8 * 0.6
-        charging_time_hours = (energy_to_charge_wh / fast_charging_watts) / 0.8 
-        charging_time_minutes = int(charging_time_hours * 60)
-        
-        avg_charging_duration = df_charging[df_charging['device_id'] == device_id]['charging_duration'].mean()
+        if not w_tomorrow.empty:
+            w = w_tomorrow.iloc[0]
+            temp_curve = np.sin(np.linspace(0, np.pi, 24))
+            hourly_temp = w['min_temp_c'] + (w['max_temp_c'] - w['min_temp_c']) * temp_curve
+            cool_h_tomorrow = np.argmin(hourly_temp)
+            pred_msg_temp = f"{cool_h_tomorrow:02d}:00"
+        elif not df_weather_forecast.empty:
+            # Fallback ke hari pertama data jika besok tidak ada
+            w = df_weather_forecast.iloc[0] 
+            temp_curve = np.sin(np.linspace(0, np.pi, 24))
+            hourly_temp = w['min_temp_c'] + (w['max_temp_c'] - w['min_temp_c']) * temp_curve
+            cool_h_tomorrow = np.argmin(hourly_temp)
+            pred_msg_temp = f"{cool_h_tomorrow:02d}:00 (Data Lama)"
+        else:
+            pred_msg_temp = "Data ramalan tidak tersedia"
 
-        explanation_usage = f"Berdasarkan pola penggunaan Anda, puncak pemakaian terjadi sekitar pukul {peak_hour_usage:02d}:00. Mengisi daya pada pukul {recommended_hour_usage:02d}:00 memastikan baterai penuh sebelum waktu sibuk."
-        explanation_temp = f"Untuk kesehatan baterai jangka panjang, direkomendasikan mengisi daya pada suhu terdingin, yaitu sekitar pukul {coolest_hour:02d}:00."
+        # Rekomendasi "SAAT INI" (Current Weather)
+        if current_temp is not None:
+            if current_temp < 28:
+                explanation_temp = f"Suhu lingkungan saat ini sangat mendukung ({current_temp}°C). Ini adalah waktu ideal untuk mengisi daya karena suhu rendah membantu menjaga kesehatan sel baterai dalam jangka panjang."
+                rec_charge_time_temp = "SANGAT DISARANKAN"
+            elif 28 <= current_temp < 33:
+                explanation_temp = f"Suhu berada di level moderat ({current_temp}°C). Anda masih bisa mengisi daya, namun pastikan tidak menggunakan aplikasi berat (seperti game) secara bersamaan untuk mencegah panas berlebih (overheating)."
+                rec_charge_time_temp = "BISA (HATI-HATI)"
+            else:
+                explanation_temp = f"Peringatan: Suhu lingkungan cukup tinggi ({current_temp}°C). Mengisi daya saat ini berisiko mempercepat degradasi baterai. Disarankan menunggu hingga suhu lingkungan turun atau pindah ke ruangan yang lebih sejuk."
+                rec_charge_time_temp = "TUNDA JIKA MUNGKIN"
+        else:
+            explanation_temp = "Data cuaca real-time tidak tersedia untuk analisis saat ini."
+            rec_charge_time_temp = "N/A"
         
-        all_recommendations.append({
-            'device_id': device_id,
-            'recommended_charge_time_usage': f"{recommended_hour_usage:02d}:00",
-            'explanation_usage': explanation_usage,
-            'recommended_charge_time_temp': f"{coolest_hour:02d}:00",
+        all_rec.append({
+            'device_id': dev_id,
+            'recommended_charge_time_usage': f"{rec_h:02d}:00",
+            'explanation_usage': expl_usage,
+            'recommended_charge_time_temp': rec_charge_time_temp,
             'explanation_temp': explanation_temp,
-            'prediction_tomorrow_temp': f"{coolest_hour_tomorrow:02d}:00",
-            'prediction_tomorrow_usage': f"{recommended_hour_tomorrow_usage:02d}:00",
-            'estimated_charging_time_minutes': charging_time_minutes,
-            'average_charging_duration_minutes': avg_charging_duration,
+            'prediction_tomorrow_temp': pred_msg_temp,
+            'prediction_tomorrow_usage': f"{rec_h:02d}:00",
+            'estimated_charging_time_minutes': est_time_fast,
+            'estimated_charging_time_normal': est_time_normal,
+            'average_charging_duration_minutes': df_charging[df_charging['device_id'] == dev_id]['dur_minutes'].mean(),
             'last_updated': datetime.now()
         })
 
-    if all_recommendations:
-        df_recommendations = pd.DataFrame(all_recommendations)
-        with engine.begin() as conn:
-            df_recommendations.to_sql('final_recommendations', engine, schema='datawarehouse', if_exists='replace', index=False)
-        print("✅ Successfully updated with SEPARATE dynamic recommendations and charging time!")
+    if all_rec:
+        pd.DataFrame(all_rec).to_sql('final_recommendations', engine, schema='datawarehouse', if_exists='replace', index=False)
 
-with DAG(
-    'battery_optimization_etl_with_weather',
-    default_args=default_args,
-    schedule_interval='@daily',
-    catchup=False,
-    tags=['dynamic_recommendation', 'device_specific', 'weather_integration'],
-) as dag:
+# --- DAG ---
+with DAG('battery_optimization_etl_with_weather', start_date=datetime(2025, 1, 1), schedule_interval='@daily', catchup=False) as dag:
+    t1_forecast = PythonOperator(task_id='fetch_weather_forecast', python_callable=fetch_and_store_weather_forecast)
+    t1_current = PythonOperator(task_id='fetch_weather_current', python_callable=fetch_current_weather)
+    t2 = PythonOperator(task_id='gen_recommendation', python_callable=generate_recommendations_with_new_charging_data)
     
-    fetch_weather_task = PythonOperator(
-        task_id='fetch_and_store_weather_forecast',
-        python_callable=fetch_and_store_weather_forecast
-    )
-
-    recommendation_task = PythonOperator(
-        task_id='generate_recommendations_with_charging_data',
-        python_callable=generate_recommendations_with_new_charging_data
-    )
-
-    fetch_weather_task >> recommendation_task
+    [t1_forecast, t1_current] >> t2
