@@ -129,7 +129,9 @@ def transform_to_dwh_layer():
     
     # Merge dengan Dim Date & App
     df_fact = df_act.merge(df_dim_date, left_on='activity_date', right_on='full_date', how='left')
-    df_fact = df_fact.merge(df_app, on='application_name', how='left')
+    df_fact = df_fact.merge(df_app[['application_name', 'activity_category', 'application_id']],
+                            on=['application_name', 'activity_category'],
+                            how='left')
     
     # Simulasikan Device ID (Distribusi Random untuk contoh data)
     import numpy as np
